@@ -788,6 +788,13 @@ export class CustomEditor extends Editor {
 			this.onCapsLock();
 			return;
 		}
+		// Flash jump mode owns the keyboard until it jumps or exits. Every
+		// app-level chord below (interrupt, model selector, push-to-talk, …)
+		// would otherwise steal its exit and label keys.
+		if (this.isFlashActive()) {
+			super.handleInput(data);
+			return;
+		}
 
 		// Bracketed-paste assembly. Some terminals fragment the start marker,
 		// the payload, and the end marker across separate stdin chunks

@@ -6,6 +6,18 @@ import {
 	midPromptSkillTokenMatches,
 } from "../autocomplete";
 import { BracketedPasteHandler, decodeReencodedPasteControls } from "../bracketed-paste";
+import {
+	applyFlashSpans,
+	computeFlashState,
+	EMPTY_FLASH_STATE,
+	type FlashLabeledMatch,
+	type FlashSpan,
+	type FlashState,
+	findFlashLabel,
+	styleFlashBackdrop,
+	styleFlashLabel,
+	styleFlashMatch,
+} from "../flash";
 import { canonicalKeyId, getKeybindings, type KeybindingsManager } from "../keybindings";
 import { extractPrintableText, matchesKey, parseKey } from "../keys";
 import { KillRing } from "../kill-ring";
@@ -368,6 +380,10 @@ interface LayoutLine {
 	width: number;
 	hasCursor: boolean;
 	cursorPos?: number;
+	/** Logical buffer line this row was laid out from. */
+	logicalLine: number;
+	/** Code-unit column in that logical line where `text` starts. */
+	startCol: number;
 }
 
 /** Per-line measurement carried across renders: exact visible width plus
@@ -452,6 +468,9 @@ export class Editor implements Component, Focusable {
 
 	// Character jump mode
 	#jumpMode: "forward" | "backward" | null = null;
+
+	/** flash.nvim-style label jump submode; non-null while it owns the keyboard. */
+	#flashState: FlashState | null = null;
 
 	// Preferred visual column for vertical cursor movement (sticky column)
 	#preferredVisualCol: number | null = null;
@@ -762,6 +781,56 @@ export class Editor implements Component, Focusable {
 		return (before.length > 0 ? decorate(before) : "") + CURSOR_MARKER + (after.length > 0 ? decorate(after) : "");
 	}
 
+	/**
+	 * Flash decorations for one laid-out row, in plain code-unit offsets relative
+	 * to `layoutLine.text`: the whole row is dimmed as activation feedback, the
+	 * matched query text is highlighted, and each label overlays the cell right
+	 * after its match. The backdrop sits at priority -1, so match and label
+	 * spans claim their cells and the dim re-establishes itself around them.
+	 *
+	 * A label replacing an in-line grapheme is padded back to that grapheme's
+	 * width, so only a label appended past the end of a row can widen it — and
+	 * that happens only within `tailBudget` spare columns.
+	 */
+	#flashSpans(layoutLine: LayoutLine, tailBudget: number): { spans: FlashSpan[]; extraWidth: number } {
+		const spans: FlashSpan[] = [];
+		const rowLength = layoutLine.text.length;
+		if (rowLength > 0) {
+			spans.push({ start: 0, end: rowLength, priority: -1, style: styleFlashBackdrop });
+		}
+		let extraWidth = 0;
+		for (const match of this.#flashState?.matches ?? []) {
+			if (match.line !== layoutLine.logicalLine) continue;
+			const start = match.col - layoutLine.startCol;
+			const end = match.end - layoutLine.startCol;
+			if (end > 0 && start < rowLength) {
+				spans.push({
+					start: Math.max(0, start),
+					end: Math.min(rowLength, end),
+					priority: 0,
+					style: styleFlashMatch,
+				});
+			}
+			if (match.label === null || end < 0) continue;
+			if (end < rowLength) {
+				const grapheme = [...segmenter.segment(layoutLine.text.slice(end))][0]?.segment ?? "";
+				const graphemeWidth = visibleWidth(grapheme);
+				// A zero-width cluster has no cell to borrow; skip rather than reflow the row.
+				if (graphemeWidth === 0) continue;
+				spans.push({
+					start: end,
+					end: end + grapheme.length,
+					priority: 1,
+					replaceWith: styleFlashLabel(match.label) + padding(graphemeWidth - 1),
+				});
+			} else if (end === rowLength && extraWidth < tailBudget) {
+				spans.push({ start: end, end, priority: 1, replaceWith: styleFlashLabel(match.label) });
+				extraWidth++;
+			}
+		}
+		return { spans, extraWidth };
+	}
+
 	#getStyledInputCursor(): { text: string; width: number } {
 		const cursorChar = this.#theme.symbols.inputCursor;
 		// Keep the software cursor steady. Ghostty/cmux can leave visual
@@ -929,6 +998,10 @@ export class Editor implements Component, Focusable {
 		const inlineHint = this.#getInlineHint();
 		const hintStyle = this.#theme.hintStyle ?? ((t: string) => `\x1b[2m${t}\x1b[0m`);
 
+		// The backdrop dims the buffer the moment the mode engages; labels join in
+		// once something has been typed to match against.
+		const flashActive = this.#flashState !== null;
+
 		for (let visibleIndex = 0; visibleIndex < visibleLayoutLines.length; visibleIndex++) {
 			const layoutLine = visibleLayoutLines[visibleIndex]!;
 			let displayText = layoutLine.text;
@@ -1077,6 +1150,17 @@ export class Editor implements Component, Focusable {
 			if (!decorated) {
 				displayText = this.#decorate(displayText);
 			}
+
+			// Flash overlay last: it addresses plain code-unit offsets and steps over
+			// the escapes every branch above may have introduced (decoration, the
+			// cursor glyph, CURSOR_MARKER), so it can never disturb them.
+			if (flashActive) {
+				const overlay = this.#flashSpans(layoutLine, Math.max(0, lineContentWidth - displayWidth));
+				if (overlay.spans.length > 0) {
+					displayText = applyFlashSpans(displayText, overlay.spans);
+					displayWidth += overlay.extraWidth;
+				}
+			}
 			if (!hasCursor) {
 				// Undecorated, unsliced lines keep their carried width; any
 				// transform above produced a new string and must be re-measured.
@@ -1153,6 +1237,12 @@ export class Editor implements Component, Focusable {
 		// lookup instead of re-parsing `data` per probe (~35 probes per key).
 		const parsedKey = parseKey(data);
 		const canonical = parsedKey === undefined ? undefined : canonicalKeyId(parsedKey);
+
+		// Flash mode owns every keystroke until it jumps or exits.
+		if (this.#flashState !== null) {
+			this.#handleFlashInput(data, canonical, kb, this.#flashState);
+			return;
+		}
 
 		// Handle character jump mode (awaiting next character to jump to)
 		if (this.#jumpMode !== null) {
@@ -1541,6 +1631,11 @@ export class Editor implements Component, Focusable {
 		} else if (kb.matchesCanonical(canonical, "tui.editor.jumpBackward")) {
 			this.#jumpMode = "backward";
 		}
+		// flash.nvim-style label jump: enter the submode, then #handleFlashInput drives it.
+		else if (kb.matchesCanonical(canonical, "tui.editor.flash")) {
+			if (this.#autocompleteState) this.#cancelAutocomplete(true);
+			this.#flashState = EMPTY_FLASH_STATE;
+		}
 		// Printable keystrokes, including Kitty CSI-u text-producing sequences.
 		else {
 			const printableText = extractPrintableText(data);
@@ -1548,6 +1643,67 @@ export class Editor implements Component, Focusable {
 				this.#insertCharacter(printableText);
 			}
 		}
+	}
+
+	/**
+	 * Flash submode key handling. Every keystroke is consumed: printable keys
+	 * either pick a label or extend the search, and anything else leaves the
+	 * mode with the caret untouched.
+	 */
+	#handleFlashInput(data: string, canonical: string | undefined, kb: KeybindingsManager, state: FlashState): void {
+		// Re-pressing the trigger, escape, or ctrl+c aborts without moving.
+		if (kb.matchesCanonical(canonical, "tui.editor.flash") || kb.matchesCanonical(canonical, "tui.select.cancel")) {
+			this.#flashState = null;
+			return;
+		}
+
+		// Enter takes the nearest match, i.e. whichever holds the first label.
+		if (kb.matchesCanonical(canonical, "tui.input.submit") || data === "\n") {
+			this.#flashState = null;
+			const nearest = state.matches[0];
+			if (nearest) this.#jumpToMatch(nearest);
+			return;
+		}
+
+		// Backspace widens the search back out; on an empty query it exits.
+		if (kb.matchesCanonical(canonical, "tui.editor.deleteCharBackward")) {
+			this.#flashState =
+				state.query.length === 0
+					? null
+					: computeFlashState(
+							this.#state.lines,
+							{ line: this.#state.cursorLine, col: this.#state.cursorCol },
+							state.query.slice(0, -1),
+						);
+			return;
+		}
+
+		const printableText = extractPrintableText(data);
+		if (printableText) {
+			// Labels are drawn from an alphabet that excludes every character which
+			// could extend the query, so this lookup is never ambiguous.
+			const labeled = printableText.length === 1 ? findFlashLabel(state, printableText) : undefined;
+			if (labeled !== undefined) {
+				this.#flashState = null;
+				this.#jumpToMatch(labeled);
+				return;
+			}
+			this.#flashState = computeFlashState(
+				this.#state.lines,
+				{ line: this.#state.cursorLine, col: this.#state.cursorCol },
+				state.query + printableText,
+			);
+			return;
+		}
+
+		// Any other control key exits the mode and is swallowed.
+		this.#flashState = null;
+	}
+
+	#jumpToMatch(match: FlashLabeledMatch): void {
+		this.#resetKillSequence();
+		this.#state.cursorLine = Math.min(match.line, this.#state.lines.length - 1);
+		this.#setCursorCol(match.col);
 	}
 
 	/** Cached per-line measurement: exact visible width now, wrap chunks on demand. */
@@ -1585,6 +1741,8 @@ export class Editor implements Component, Focusable {
 				width: 0,
 				hasCursor: true,
 				cursorPos: 0,
+				logicalLine: 0,
+				startCol: 0,
 			});
 			return layoutLines;
 		}
@@ -1597,20 +1755,14 @@ export class Editor implements Component, Focusable {
 
 			if (lineVisibleWidth <= contentWidth) {
 				// Line fits in one layout line
-				if (isCurrentLine) {
-					layoutLines.push({
-						text: line,
-						width: lineVisibleWidth,
-						hasCursor: true,
-						cursorPos: this.#state.cursorCol,
-					});
-				} else {
-					layoutLines.push({
-						text: line,
-						width: lineVisibleWidth,
-						hasCursor: false,
-					});
-				}
+				layoutLines.push({
+					text: line,
+					width: lineVisibleWidth,
+					hasCursor: isCurrentLine,
+					cursorPos: isCurrentLine ? this.#state.cursorCol : undefined,
+					logicalLine: i,
+					startCol: 0,
+				});
 			} else {
 				// Line needs wrapping - use word-aware wrapping
 				const chunks = this.#wrapLine(line, contentWidth);
@@ -1645,20 +1797,14 @@ export class Editor implements Component, Focusable {
 						}
 					}
 
-					if (hasCursorInChunk) {
-						layoutLines.push({
-							text: chunk.text,
-							width: chunk.width,
-							hasCursor: true,
-							cursorPos: adjustedCursorPos,
-						});
-					} else {
-						layoutLines.push({
-							text: chunk.text,
-							width: chunk.width,
-							hasCursor: false,
-						});
-					}
+					layoutLines.push({
+						text: chunk.text,
+						width: chunk.width,
+						hasCursor: hasCursorInChunk,
+						cursorPos: hasCursorInChunk ? adjustedCursorPos : undefined,
+						logicalLine: i,
+						startCol: chunk.startIndex,
+					});
 				}
 			}
 		}
@@ -3228,6 +3374,13 @@ export class Editor implements Component, Focusable {
 
 	isShowingAutocomplete(): boolean {
 		return this.#autocompleteState !== null;
+	}
+
+	/** True while the flash jump submode owns the keyboard. Hosts that intercept
+	 *  keys ahead of {@link handleInput} MUST forward everything to the base
+	 *  editor while this holds, or the submode loses its exit and label keys. */
+	isFlashActive(): boolean {
+		return this.#flashState !== null;
 	}
 
 	async #updateAutocomplete(): Promise<void> {

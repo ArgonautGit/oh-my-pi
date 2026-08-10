@@ -73,6 +73,53 @@ describe("CustomEditor keybindings", () => {
 		expect(onDisplayReset).toHaveBeenCalledTimes(1);
 		expect(onLiveToggle).toHaveBeenCalledTimes(1);
 	});
+
+	it("stops app chords from stealing keys while the flash jump submode is active", () => {
+		const editor = new CustomEditor(getEditorTheme());
+		const onEscape = vi.fn();
+		const onSelectModel = vi.fn();
+
+		editor.onEscape = onEscape;
+		editor.onSelectModel = onSelectModel;
+		editor.setText("one two\nthree two");
+
+		editor.handleInput("\x1bj"); // Alt+J enters flash mode
+		expect(editor.isFlashActive()).toBe(true);
+
+		// A query character is consumed by the submode, never inserted.
+		editor.handleInput("t");
+		expect(editor.getText()).toBe("one two\nthree two");
+
+		// Escape belongs to the submode here, not to app.interrupt.
+		editor.handleInput("\x1b");
+		expect(editor.isFlashActive()).toBe(false);
+		expect(onEscape).not.toHaveBeenCalled();
+
+		// Any other app chord exits the submode and is swallowed rather than firing.
+		editor.handleInput("\x1bj");
+		editor.handleInput("t");
+		editor.handleInput("\x1bm"); // Alt+M / app.model.select
+		expect(editor.isFlashActive()).toBe(false);
+		expect(onSelectModel).not.toHaveBeenCalled();
+
+		// Once the submode is gone the same chords reach the app again.
+		editor.handleInput("\x1b");
+		editor.handleInput("\x1bm");
+		expect(onEscape).toHaveBeenCalledTimes(1);
+		expect(onSelectModel).toHaveBeenCalledTimes(1);
+	});
+
+	it("jumps the caret to a label typed through the app editor", () => {
+		const editor = new CustomEditor(getEditorTheme());
+		editor.setText("one two\nthree two");
+
+		editor.handleInput("\x1bj");
+		editor.handleInput("t");
+		editor.handleInput("d");
+
+		expect(editor.getCursor()).toEqual({ line: 0, col: 4 });
+		expect(editor.getText()).toBe("one two\nthree two");
+	});
 });
 
 describe("shipped dequeue defaults", () => {

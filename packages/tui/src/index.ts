@@ -23,6 +23,8 @@ export * from "./deccara";
 export * from "./desktop-notify";
 // Editor component interface (for custom editors)
 export type * from "./editor-component";
+// flash.nvim-style label jump
+export * from "./flash";
 // Fuzzy matching
 export * from "./fuzzy";
 // Keybindings

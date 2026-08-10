@@ -16,6 +16,7 @@ export interface Keybindings {
 	"tui.editor.cursorLineEnd": true;
 	"tui.editor.jumpForward": true;
 	"tui.editor.jumpBackward": true;
+	"tui.editor.flash": true;
 	"tui.editor.pageUp": true;
 	"tui.editor.pageDown": true;
 	"tui.editor.deleteCharBackward": true;
@@ -88,6 +89,10 @@ export const TUI_KEYBINDINGS = {
 	"tui.editor.jumpBackward": {
 		defaultKeys: "ctrl+alt+]",
 		description: "Jump backward to character",
+	},
+	"tui.editor.flash": {
+		defaultKeys: "alt+j",
+		description: "Jump to a labeled search match",
 	},
 	"tui.editor.pageUp": { defaultKeys: "pageUp", description: "Page up" },
 	"tui.editor.pageDown": { defaultKeys: "pageDown", description: "Page down" },
