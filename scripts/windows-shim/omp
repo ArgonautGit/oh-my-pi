@@ -1,0 +1,20 @@
+#!/bin/sh
+# Run omp from the flash-input fork instead of the installed binary (bash/sh shells).
+# Windows shells use the sibling omp.cmd. Delete both to fall back to the stock install.
+CACHE="$LOCALAPPDATA/omp-leap-update.txt"
+
+# Print the cached update hint, if any (never blocks on the network).
+if [ -f "$CACHE" ]; then
+	COUNT=$(head -n1 "$CACHE" | tr -d '\r\n ')
+	if [ -n "$COUNT" ] && [ "$COUNT" != "0" ]; then
+		echo "omp: $COUNT commit(s) behind upstream — rebase flash-input in omp-leap when convenient." >&2
+	fi
+fi
+
+# Refresh the cache in the background, at most once a day.
+if [ ! -f "$CACHE" ] || [ -n "$(find "$CACHE" -mtime +0 2>/dev/null)" ]; then
+	powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass \
+		-File "C:/Users/nick/.local/bin/omp-update-check.ps1" >/dev/null 2>&1 &
+fi
+
+exec "C:/Users/nick/.bun/bin/bun.exe" --cwd="C:/Users/nick/Documents/programming/omp-leap/packages/coding-agent" src/cli.ts "$@"
